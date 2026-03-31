@@ -7,22 +7,319 @@ const path = require('path');
 
 const app = express();
 const PORT = 3000;
-const DATA_FILE = path.join(__dirname, 'invoices', 'data.json');
+const DATA_DIR = path.join(__dirname, 'data');
+const INVOICES_DIR = path.join(DATA_DIR, 'invoices');
+const CLIENTS_DIR = path.join(DATA_DIR, 'clients');
+const LEGACY_DATA_FILE = path.join(__dirname, 'invoices', 'data.json');
+const DEFAULT_LAST_INVOICE_NUMBER = 1000;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Ensure data file exists
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ lastInvoiceNumber: 1000, invoices: [] }));
+ensureStorageDirs();
+
+function ensureDirectory(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function ensureStorageDirs() {
+  ensureDirectory(DATA_DIR);
+  ensureDirectory(INVOICES_DIR);
+  ensureDirectory(CLIENTS_DIR);
+}
+
+function ensureDataShape(data) {
+  const normalized = data && typeof data === 'object' ? data : {};
+
+  if (!Number.isFinite(Number(normalized.lastInvoiceNumber))) {
+    normalized.lastInvoiceNumber = DEFAULT_LAST_INVOICE_NUMBER;
+  } else {
+    normalized.lastInvoiceNumber = parseInt(normalized.lastInvoiceNumber, 10);
+  }
+
+  if (!Array.isArray(normalized.invoices)) {
+    normalized.invoices = [];
+  }
+
+  if (!Array.isArray(normalized.clients)) {
+    normalized.clients = [];
+  }
+
+  return normalized;
+}
+
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function writeJsonFile(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function normalizeClientProfile(profile) {
+  return {
+    name: String(profile?.name || '').trim(),
+    email: String(profile?.email || '').trim(),
+    address: String(profile?.address || '').trim()
+  };
+}
+
+function getClientFingerprint(profile) {
+  return [profile.name, profile.email, profile.address]
+    .map(value => value.trim().toLowerCase())
+    .join('|');
+}
+
+function isSafeFileId(value) {
+  return /^[A-Za-z0-9_-]+$/.test(String(value || ''));
+}
+
+function toMonthKey(value) {
+  if (typeof value === 'string' && /^\d{4}-\d{2}/.test(value)) {
+    return value.slice(0, 7);
+  }
+
+  const date = new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) {
+    return new Date().toISOString().slice(0, 7);
+  }
+
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function listJsonFiles(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    return [];
+  }
+
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+
+  return entries.flatMap(entry => {
+    const entryPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      return listJsonFiles(entryPath);
+    }
+    return path.extname(entry.name) === '.json' ? [entryPath] : [];
+  });
+}
+
+function getInvoiceFilePath(invoiceId, invoiceDate) {
+  const monthMatch = /^(\d{4}-\d{2})-\d{4}$/.exec(String(invoiceId || ''));
+  const monthKey = monthMatch ? monthMatch[1] : toMonthKey(invoiceDate);
+  const monthDir = path.join(INVOICES_DIR, monthKey);
+  ensureDirectory(monthDir);
+  return path.join(monthDir, `${invoiceId}.json`);
+}
+
+function getClientFilePath(clientId) {
+  return path.join(CLIENTS_DIR, `${clientId}.json`);
+}
+
+function normalizeStoredClient(client, fallbackId) {
+  const timestamp = new Date().toISOString();
+  const normalized = normalizeClientProfile(client);
+
+  return {
+    ...client,
+    ...normalized,
+    id: String(client?.id || fallbackId || '').trim(),
+    createdAt: client?.createdAt || timestamp,
+    updatedAt: client?.updatedAt || client?.createdAt || timestamp
+  };
+}
+
+function normalizeStoredInvoice(invoice, fallbackId) {
+  const invoiceId = String(invoice?.invoiceId || invoice?.id || fallbackId || '').trim();
+
+  return {
+    ...invoice,
+    id: invoiceId,
+    invoiceId
+  };
+}
+
+function getInvoiceSortValue(invoice) {
+  const timestamp = new Date(invoice.createdAt || invoice.invoiceDate || 0).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function readClients() {
+  ensureStorageDirs();
+
+  return listJsonFiles(CLIENTS_DIR)
+    .map(filePath => normalizeStoredClient(readJsonFile(filePath), path.basename(filePath, '.json')))
+    .filter(client => client.id)
+    .sort((left, right) => new Date(right.updatedAt || 0).getTime() - new Date(left.updatedAt || 0).getTime());
+}
+
+function readInvoices() {
+  ensureStorageDirs();
+
+  return listJsonFiles(INVOICES_DIR)
+    .map(filePath => normalizeStoredInvoice(readJsonFile(filePath), path.basename(filePath, '.json')))
+    .filter(invoice => invoice.invoiceNumber)
+    .sort((left, right) => {
+      const timeDiff = getInvoiceSortValue(right) - getInvoiceSortValue(left);
+      if (timeDiff !== 0) {
+        return timeDiff;
+      }
+
+      return String(right.invoiceNumber).localeCompare(String(left.invoiceNumber), undefined, { numeric: true });
+    });
+}
+
+function computeLastInvoiceNumber(invoices) {
+  return invoices.reduce((highest, invoice) => {
+    const invoiceNumber = parseInt(invoice.invoiceNumber, 10);
+    if (!Number.isFinite(invoiceNumber)) {
+      return highest;
+    }
+    return Math.max(highest, invoiceNumber);
+  }, DEFAULT_LAST_INVOICE_NUMBER);
 }
 
 function readData() {
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  migrateLegacyDataIfNeeded();
+  const invoices = readInvoices();
+  const clients = readClients();
+
+  return {
+    lastInvoiceNumber: computeLastInvoiceNumber(invoices),
+    invoices,
+    clients
+  };
 }
 
-function writeData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+function writeInvoice(invoice) {
+  const normalizedInvoice = normalizeStoredInvoice(invoice, invoice.invoiceId || invoice.id);
+  writeJsonFile(getInvoiceFilePath(normalizedInvoice.invoiceId, normalizedInvoice.invoiceDate), normalizedInvoice);
+  return normalizedInvoice;
+}
+
+function writeClient(client) {
+  const normalizedClient = normalizeStoredClient(client, client.id);
+  writeJsonFile(getClientFilePath(normalizedClient.id), normalizedClient);
+  return normalizedClient;
+}
+
+function generateInvoiceId(invoiceDate) {
+  const monthKey = toMonthKey(invoiceDate);
+  const monthDir = path.join(INVOICES_DIR, monthKey);
+  ensureDirectory(monthDir);
+
+  const nextSequence = listJsonFiles(monthDir).reduce((highest, filePath) => {
+    const match = /-(\d{4})\.json$/.exec(path.basename(filePath));
+    if (!match) {
+      return highest;
+    }
+    return Math.max(highest, parseInt(match[1], 10));
+  }, 0) + 1;
+
+  return `${monthKey}-${String(nextSequence).padStart(4, '0')}`;
+}
+
+function generateClientId() {
+  const nextSequence = listJsonFiles(CLIENTS_DIR).reduce((highest, filePath) => {
+    const match = /^client-(\d{4})\.json$/.exec(path.basename(filePath));
+    if (!match) {
+      return highest;
+    }
+    return Math.max(highest, parseInt(match[1], 10));
+  }, 0) + 1;
+
+  return `client-${String(nextSequence).padStart(4, '0')}`;
+}
+
+function upsertClientProfile(profile) {
+  const clientProfile = normalizeClientProfile(profile);
+
+  if (!clientProfile.name) {
+    return null;
+  }
+
+  const existingClient = readClients().find(client => {
+    return getClientFingerprint(normalizeClientProfile(client)) === getClientFingerprint(clientProfile);
+  });
+
+  if (existingClient) {
+    return writeClient({
+      ...existingClient,
+      ...clientProfile,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  const timestamp = new Date().toISOString();
+  return writeClient({
+    id: generateClientId(),
+    ...clientProfile,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+}
+
+function findInvoiceRecordByNumber(invoiceNumber) {
+  return listJsonFiles(INVOICES_DIR).reduce((found, filePath) => {
+    if (found) {
+      return found;
+    }
+
+    const invoice = normalizeStoredInvoice(readJsonFile(filePath), path.basename(filePath, '.json'));
+    if (String(invoice.invoiceNumber) !== String(invoiceNumber)) {
+      return null;
+    }
+
+    return { invoice, filePath };
+  }, null);
+}
+
+function migrateLegacyDataIfNeeded() {
+  ensureStorageDirs();
+
+  if (!fs.existsSync(LEGACY_DATA_FILE)) {
+    return;
+  }
+
+  if (listJsonFiles(INVOICES_DIR).length > 0 || listJsonFiles(CLIENTS_DIR).length > 0) {
+    return;
+  }
+
+  const legacyData = ensureDataShape(readJsonFile(LEGACY_DATA_FILE));
+  const sequenceByMonth = new Map();
+
+  const invoices = [...legacyData.invoices].sort((left, right) => {
+    const monthCompare = toMonthKey(left.invoiceDate || left.createdAt).localeCompare(toMonthKey(right.invoiceDate || right.createdAt));
+    if (monthCompare !== 0) {
+      return monthCompare;
+    }
+
+    const numberDiff = (parseInt(left.invoiceNumber, 10) || 0) - (parseInt(right.invoiceNumber, 10) || 0);
+    if (numberDiff !== 0) {
+      return numberDiff;
+    }
+
+    return new Date(left.createdAt || left.invoiceDate || 0).getTime() - new Date(right.createdAt || right.invoiceDate || 0).getTime();
+  });
+
+  invoices.forEach(invoice => {
+    const monthKey = toMonthKey(invoice.invoiceDate || invoice.createdAt);
+    const nextSequence = (sequenceByMonth.get(monthKey) || 0) + 1;
+    sequenceByMonth.set(monthKey, nextSequence);
+
+    writeInvoice({
+      ...invoice,
+      invoiceId: `${monthKey}-${String(nextSequence).padStart(4, '0')}`,
+      createdAt: invoice.createdAt || new Date().toISOString()
+    });
+  });
+
+  legacyData.clients.forEach(client => {
+    const legacyId = isSafeFileId(client?.id) ? String(client.id) : generateClientId();
+    writeClient({
+      ...client,
+      id: legacyId
+    });
+  });
 }
 
 // Get next invoice number + all invoices
@@ -33,29 +330,41 @@ app.get('/api/invoices', (req, res) => {
 
 // Save a new invoice
 app.post('/api/invoices', (req, res) => {
-  const data = readData();
-  const invoice = req.body;
-  invoice.id = Date.now();
+  const invoice = { ...req.body };
+  const shouldSaveClientProfile = Boolean(invoice.saveClientProfile);
+  let savedClient = null;
+
+  if (shouldSaveClientProfile) {
+    savedClient = upsertClientProfile(invoice.clientProfile);
+  }
+
+  delete invoice.saveClientProfile;
+  delete invoice.clientProfile;
+
+  invoice.invoiceId = generateInvoiceId(invoice.invoiceDate);
+  invoice.id = invoice.invoiceId;
   invoice.createdAt = new Date().toISOString();
-  data.invoices.unshift(invoice);
-  data.lastInvoiceNumber = parseInt(invoice.invoiceNumber);
-  writeData(data);
-  res.json({ success: true, invoice });
+
+  if (savedClient) {
+    invoice.clientProfileId = savedClient.id;
+  }
+
+  const storedInvoice = writeInvoice(invoice);
+  res.json({ success: true, invoice: storedInvoice, clientProfile: savedClient, clients: readClients() });
 });
 
 // Get single invoice by invoice number
 app.get('/api/invoices/:number', (req, res) => {
-  const data = readData();
-  const invoice = data.invoices.find(inv => inv.invoiceNumber === req.params.number);
-  if (!invoice) return res.status(404).json({ error: 'Not found' });
-  res.json(invoice);
+  const invoiceRecord = findInvoiceRecordByNumber(req.params.number);
+  if (!invoiceRecord) return res.status(404).json({ error: 'Not found' });
+  res.json(invoiceRecord.invoice);
 });
 
 // Delete invoice
 app.delete('/api/invoices/:number', (req, res) => {
-  const data = readData();
-  data.invoices = data.invoices.filter(inv => inv.invoiceNumber !== req.params.number);
-  writeData(data);
+  const invoiceRecord = findInvoiceRecordByNumber(req.params.number);
+  if (!invoiceRecord) return res.status(404).json({ error: 'Not found' });
+  fs.unlinkSync(invoiceRecord.filePath);
   res.json({ success: true });
 });
 

@@ -169,6 +169,12 @@
     .form-group { display: flex; flex-direction: column; gap: 6px; }
     .form-group.full { grid-column: 1 / -1; }
 
+    .field-hint {
+      font-size: 12px;
+      color: var(--ink-muted);
+      line-height: 1.4;
+    }
+
     label {
       font-size: 11.5px;
       font-weight: 600;
@@ -521,17 +527,24 @@
       <div class="card">
         <div class="card-title">Bill To</div>
         <div class="form-grid">
+          <div class="form-group full">
+            <label>Saved Client Profile</label>
+            <select id="clientProfile" onchange="handleClientProfileChange()">
+              <option value="">Select a saved client</option>
+            </select>
+            <div class="field-hint">Choose a saved client to pre-fill the Bill To fields, or enter details manually to create a new profile when saving.</div>
+          </div>
           <div class="form-group">
             <label>Client Name / Company</label>
-            <input type="text" id="clientName" placeholder="Acme Corp">
+            <input type="text" id="clientName" placeholder="Acme Corp" oninput="syncClientSelectionFromFields()">
           </div>
           <div class="form-group">
             <label>Client Email</label>
-            <input type="email" id="clientEmail" placeholder="billing@client.com">
+            <input type="email" id="clientEmail" placeholder="billing@client.com" oninput="syncClientSelectionFromFields()">
           </div>
           <div class="form-group full">
             <label>Client Address</label>
-            <textarea id="clientAddress" rows="2" placeholder="456 Client Ave, New York, NY 10001"></textarea>
+            <textarea id="clientAddress" rows="2" placeholder="456 Client Ave, New York, NY 10001" oninput="syncClientSelectionFromFields()"></textarea>
           </div>
         </div>
       </div>
@@ -644,15 +657,25 @@
 <div class="toast" id="toast"></div>
 
 <script>
-  let invoiceData = { lastInvoiceNumber: 1000, invoices: [] };
+  let invoiceData = { lastInvoiceNumber: 1000, invoices: [], clients: [] };
+  let isApplyingClientProfile = false;
 
   // ── Init ───────────────────────────────────────
   async function init() {
     const res = await fetch('/api/invoices');
-    invoiceData = await res.json();
+    invoiceData = normalizeInvoiceData(await res.json());
+    renderClientProfileOptions();
     setDefaultDates();
     setNextInvoiceNumber();
     addLineItem();
+  }
+
+  function normalizeInvoiceData(data) {
+    return {
+      lastInvoiceNumber: Number.parseInt(data?.lastInvoiceNumber, 10) || 1000,
+      invoices: Array.isArray(data?.invoices) ? data.invoices : [],
+      clients: Array.isArray(data?.clients) ? data.clients : []
+    };
   }
 
   function setDefaultDates() {
@@ -670,6 +693,75 @@
   function setNextInvoiceNumber() {
     const next = (invoiceData.lastInvoiceNumber || 1000) + 1;
     document.getElementById('invoiceNumber').value = String(next).padStart(4, '0');
+  }
+
+  function normalizeClientProfile(profile) {
+    return {
+      name: String(profile?.name || '').trim(),
+      email: String(profile?.email || '').trim(),
+      address: String(profile?.address || '').trim()
+    };
+  }
+
+  function getClientFingerprint(profile) {
+    return [profile.name, profile.email, profile.address]
+      .map(value => value.trim().toLowerCase())
+      .join('|');
+  }
+
+  function getCurrentClientProfile() {
+    return normalizeClientProfile({
+      name: document.getElementById('clientName').value,
+      email: document.getElementById('clientEmail').value,
+      address: document.getElementById('clientAddress').value
+    });
+  }
+
+  function findMatchingClient(profile) {
+    const normalizedProfile = normalizeClientProfile(profile);
+    if (!normalizedProfile.name) return null;
+    const fingerprint = getClientFingerprint(normalizedProfile);
+    return invoiceData.clients.find(client => getClientFingerprint(normalizeClientProfile(client)) === fingerprint) || null;
+  }
+
+  function renderClientProfileOptions() {
+    const select = document.getElementById('clientProfile');
+    if (!select) return;
+
+    const currentValue = select.value;
+    const options = ['<option value="">Select a saved client</option>'];
+
+    invoiceData.clients.forEach(client => {
+      options.push(`<option value="${escHtml(String(client.id))}">${escHtml(client.name)}</option>`);
+    });
+
+    select.innerHTML = options.join('');
+
+    if (currentValue && invoiceData.clients.some(client => String(client.id) === currentValue)) {
+      select.value = currentValue;
+      return;
+    }
+
+    const matchingClient = findMatchingClient(getCurrentClientProfile());
+    select.value = matchingClient ? String(matchingClient.id) : '';
+  }
+
+  function handleClientProfileChange() {
+    const clientId = document.getElementById('clientProfile').value;
+    const client = invoiceData.clients.find(entry => String(entry.id) === clientId);
+    if (!client) return;
+
+    isApplyingClientProfile = true;
+    document.getElementById('clientName').value = client.name || '';
+    document.getElementById('clientEmail').value = client.email || '';
+    document.getElementById('clientAddress').value = client.address || '';
+    isApplyingClientProfile = false;
+  }
+
+  function syncClientSelectionFromFields() {
+    if (isApplyingClientProfile) return;
+    const matchingClient = findMatchingClient(getCurrentClientProfile());
+    document.getElementById('clientProfile').value = matchingClient ? String(matchingClient.id) : '';
   }
 
   // ── Views ──────────────────────────────────────
@@ -769,6 +861,7 @@
       clientName,
       clientEmail: document.getElementById('clientEmail').value,
       clientAddress: document.getElementById('clientAddress').value,
+      clientProfileId: document.getElementById('clientProfile').value || null,
       lineItems,
       taxRate,
       taxAmount,
@@ -780,25 +873,68 @@
     };
   }
 
+  async function buildInvoicePayload() {
+    const inv = collectInvoice();
+    if (!inv) return null;
+
+    const matchingClient = findMatchingClient({
+      name: inv.clientName,
+      email: inv.clientEmail,
+      address: inv.clientAddress
+    });
+
+    if (matchingClient) {
+      inv.clientProfileId = matchingClient.id;
+      return inv;
+    }
+
+    const shouldCreateClient = window.confirm('Save this Bill To contact as a reusable client profile for future invoices?');
+    if (shouldCreateClient) {
+      inv.saveClientProfile = true;
+      inv.clientProfile = {
+        name: inv.clientName,
+        email: inv.clientEmail,
+        address: inv.clientAddress
+      };
+    }
+
+    return inv;
+  }
+
+  async function persistInvoice(inv) {
+    const res = await fetch('/api/invoices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(inv)
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || 'Save failed');
+    }
+
+    invoiceData.lastInvoiceNumber = parseInt(data.invoice.invoiceNumber, 10);
+    invoiceData.invoices = [data.invoice, ...invoiceData.invoices.filter(existing => existing.invoiceNumber !== data.invoice.invoiceNumber)];
+    invoiceData.clients = Array.isArray(data.clients) ? data.clients : invoiceData.clients;
+    renderClientProfileOptions();
+
+    if (data.clientProfile) {
+      document.getElementById('clientProfile').value = String(data.clientProfile.id);
+    }
+
+    return data;
+  }
+
   // ── Save ──────────────────────────────────────
   async function saveInvoice() {
-    const inv = collectInvoice();
+    const inv = await buildInvoicePayload();
     if (!inv) return;
     const btn = document.getElementById('saveBtn');
     btn.disabled = true;
     try {
-      const res = await fetch('/api/invoices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(inv)
-      });
-      const data = await res.json();
-      if (data.success) {
-        invoiceData.lastInvoiceNumber = parseInt(inv.invoiceNumber);
-        invoiceData.invoices.unshift(data.invoice);
-        showToast('Invoice saved!', 'success');
-        setNextInvoiceNumber();
-      }
+      const data = await persistInvoice(inv);
+      showToast(data.clientProfile ? 'Invoice and client profile saved!' : 'Invoice saved!', 'success');
+      setNextInvoiceNumber();
     } catch (e) {
       showToast('Save failed: ' + e.message, 'error');
     }
@@ -807,7 +943,7 @@
 
   // ── PDF Export ────────────────────────────────
   async function saveAndExportPDF() {
-    const inv = collectInvoice();
+    const inv = await buildInvoicePayload();
     if (!inv) return;
 
     const btn = document.getElementById('pdfBtn');
@@ -815,14 +951,8 @@
     btn.innerHTML = '<div class="spinner"></div> Generating PDF…';
 
     try {
-      // Save first
-      await fetch('/api/invoices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(inv)
-      });
+      const data = await persistInvoice(inv);
 
-      // Then PDF
       const res = await fetch('/api/invoices/pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -842,10 +972,8 @@
       a.click();
       URL.revokeObjectURL(url);
 
-      invoiceData.lastInvoiceNumber = parseInt(inv.invoiceNumber);
-      invoiceData.invoices.unshift({ ...inv, id: Date.now(), createdAt: new Date().toISOString() });
       setNextInvoiceNumber();
-      showToast('PDF downloaded!', 'success');
+      showToast(data.clientProfile ? 'Invoice saved, client saved, PDF downloaded!' : 'PDF downloaded!', 'success');
     } catch (e) {
       showToast('Error: ' + e.message, 'error');
     }
@@ -858,7 +986,8 @@
   async function renderInvoiceList() {
     try {
       const res = await fetch('/api/invoices');
-      invoiceData = await res.json();
+      invoiceData = normalizeInvoiceData(await res.json());
+      renderClientProfileOptions();
     } catch (e) { /* use cached data on network failure */ }
     const container = document.getElementById('invoiceList');
     const invoices = invoiceData.invoices;
@@ -921,6 +1050,7 @@
 
   // ── Utilities ─────────────────────────────────
   function clearForm() {
+    document.getElementById('clientProfile').value = '';
     document.getElementById('clientName').value = '';
     document.getElementById('clientEmail').value = '';
     document.getElementById('clientAddress').value = '';

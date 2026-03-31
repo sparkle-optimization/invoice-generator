@@ -52,7 +52,7 @@ RUN npm install --omit=dev
 COPY . .
 
 # Keep runtime paths available even if they are not in the repo yet.
-RUN mkdir -p /app/invoices /app/public && \
+RUN mkdir -p /app/data/invoices /app/data/clients /app/public && \
     if [ -f /app/index.html ] && [ ! -f /app/public/index.html ]; then cp /app/index.html /app/public/index.html; fi
 
 ENV NODE_ENV=production
