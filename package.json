@@ -1,0 +1,14 @@
+{
+  "name": "sparkle-invoice-generator",
+  "version": "1.0.0",
+  "description": "Invoice Generator for Sparkle Optimization LLC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^21.5.2"
+  }
+}

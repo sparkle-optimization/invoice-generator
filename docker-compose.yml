@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sparkle Optimization LLC. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  invoice-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sparkle-invoice-generator
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./invoices:/app/invoices
+    environment:
+      - NODE_ENV=production
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    shm_size: "1gb"
+    restart: unless-stopped
